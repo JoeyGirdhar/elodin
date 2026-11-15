@@ -146,6 +146,13 @@ test_steps = [
                 label="cargo fmt",
                 command="cargo fmt --check && cargo fmt --check --manifest-path fsw/sensor-fw/Cargo.toml",
             ),
+            # The Falcon 9 flight software is its own crate outside the
+            # workspace, so the workspace steps above never build or test it.
+            nix_step(
+                emoji=":crab:",
+                label="falcon9 flight software",
+                command="cd examples/falcon9/controller && cargo fmt --check && cargo clippy --all-targets -- -Dwarnings && cargo test --release",
+            ),
         ],
     ),
     group(
@@ -226,6 +233,12 @@ test_steps = [
                 label=":python: betaflight-sitl tests",
                 flake=".#run",
                 command="python3 -m pytest examples/betaflight-sitl/tests -q",
+            ),
+            nix_step(
+                label=":python: falcon9 tests",
+                flake=".#run",
+                # Full closed-loop flights are marked slow and skipped here.
+                command="python3 -m pytest examples/falcon9 -q",
             ),
             nix_step(
                 label=":python: frames",
