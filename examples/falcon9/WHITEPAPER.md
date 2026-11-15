@@ -913,7 +913,7 @@ the downstream q̄ peak (~60 kPa reconstructed) and heating. A predictor-based
 cutoff — integrate the no-thrust descent forward, cut when predicted peak q̄
 drops below the limit — is the stretch goal; the Δv gate is the baseline.
 
-### 11.5 Landing burn: ZEM/ZEV + hoverslam
+### 11.5 Landing burn: hoverslam + ZEM/ZEV
 
 The booster cannot hover: at landing mass `m ≈ 27 t` (*est.*), even minimum
 single-engine throttle gives
@@ -923,31 +923,66 @@ T_min/W ≈ 0.57 × 760 kN / (27e3 × 9.81) ≈ 1.6  > 1
 ```
 
 so the burn must be timed to reach a soft touchdown at h = 0 — the *hoverslam*
-(suicide burn). Constant-deceleration kinematics still arm ignition and own
-the vertical rate loop:
+(suicide burn). Constant-deceleration kinematics arm ignition:
 
 ```text
 ignite when   h ≤ v² / (2 a_net) + h_margin,       a_net = T/m − g_eff
-in-burn:      v_des(h) = √(2 a_land h) + v_td,     a_up = g + k (v↓ − v_des)
 ```
 
-**Lateral / attitude** uses Guo/Hawkins/Wie ZEM/ZEV feedback with a 150 m /
-−25 m/s waypoint above LZ-1, then pad / −1.2 m/s:
+**Vertical channel.** In the burn the FSW flies the constant deceleration
+that reaches the touchdown speed exactly at the pad, re-solved from the
+navigated state every guidance step:
 
 ```text
-ZEM = r_tgt − (r + v t_go + ½ g t_go²)
-ZEV = v_tgt − (v + g t_go)
-a_cmd = 6 ZEM/t_go² − 2 ZEV/t_go − g
+a_req = (v↓² − v_td²) / (2 h_pad),      a_net = clamp(a_req, a_min(n), a_max(n))
+u     = (m (g + a_net) / (n k̂ cos θ) + p_a A_e) / T_vac
 ```
 
-Attitude = direction of `a_cmd` (tilt ≤ 0.25 rad); throttle stays on the
-hoverslam vertical channel so the no-hover constraint is not violated.
-Lateral guidance remains active until touchdown: a small position error
-alone does not imply that sideways velocity has been cancelled.
-If min-throttle lofting starts below 100 m, engines cut until descending
-again. Legs are rated **2 m/s** impact (vertical and total contact speed);
-soft-landing gates also require tilt ≤ 2°, |ω| ≤ 1°/s, lateral ≤ 1.5 m/s,
-miss ≤ 5 m.
+`h_pad` is the height of the lowest leg pad (radar height at the engine plane
+minus `R_leg sin θ`). The radar height is carried forward with the navigated
+descent rate between 40 Hz samples rather than averaged, which would trail a
+descending booster by decimetres. `k̂` is an in-flight thrust estimate: the
+measured axial specific force over what the engine model predicts for the
+(lagged) throttle, filtered over ~1 s once the engine set has settled. It
+matters because the vehicle cannot throttle below `T_min`: a hot engine set
+over-brakes, `a_req` shrinks every step until min throttle out-decelerates
+it, and the booster stops short above the pad. With the estimate, touchdown
+speed moves by less than 0.1 m/s across the campaign's −6 %/+14 % thrust
+range (Exercise 3).
+
+**3 → 1 handover.** The burn opens on three engines and hands over to the
+center one when the state the outboard pair leaves behind, including their
+shutdown tail-off impulse `≈ 2 T τ_off / m`, sits in the middle of the
+single-engine deceleration band. Handing over at the band's lower edge
+strands the booster below what one engine can fly at min throttle. The
+center engine has used its last TEA-TEB charge by then, so it stays lit
+until contact; a booster that has stopped short and started to rise shuts
+down while the drop is still centimetres rather than climbing away.
+
+**Lateral channel.** Above a 30 m terminal gate, horizontal ZEM/ZEV
+(Guo/Hawkins/Wie) targets the point over LZ-1 with no sideways velocity at
+the gate:
+
+```text
+ZEM = −(r + v t_go),   ZEV = −v,   a_lat = 6 ZEM/t_go² − 2 ZEV/t_go
+```
+
+`t_go` is the time to the gate on the current vertical solution, floored at
+three attitude lags (4.5 s): a single gimbaled Merlin needs ~1.5 s to change
+the lean, and the ZEM gain grows as 1/t_go². `r` and `v` are propagated one
+attitude lag ahead with the acceleration the current lean is producing.
+Below the gate only horizontal velocity is nulled (Apollo P66-style); a
+metre of miss this close to the pad is not worth a lean, and lateral braking
+stays on until contact. The thrust tilt allowance tapers from 0.25 rad above
+150 m to 0.07 rad at the gate and 0.02 rad at the pad. Legs are rated
+**2 m/s** impact (vertical and total contact speed); soft-landing gates also
+require tilt ≤ 2°, |ω| ≤ 1°/s, lateral ≤ 1.5 m/s, miss ≤ 5 m.
+
+The burn is regression-tested in `controller/src/landing_sim.rs`, which flies
+`Fsw::step` from ignition to leg contact against a reduced plant mirroring
+`sim.py`'s engine arming and spool model, TVC attitude loop, plume-dominated
+drag, mass properties, and sensors — a nominal burn, the full thrust range,
+and 100 dispersed ignitions, in about a second under `cargo test --release`.
 
 Landing-burn coordination: TVC owns pitch/yaw while fins run
 **rate-damping only**. Attitude setpoints are slew-limited across the

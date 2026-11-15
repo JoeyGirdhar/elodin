@@ -5,7 +5,8 @@ at ~3 km) and integrates the accel-vector law with hoverslam-derived t_go.
 Gate: terminal position err < 2 m and velocity err < 0.5 m/s vs soft target.
 This is an idealized reference algorithm, including a vertical-only terminal
 phase, not a replay of the Rust controller. The controller's terminal braking
-regression is tested directly in controller/src/main.rs and in full SITL runs.
+regression is tested in controller/src/landing_sim.rs (landing burn in the loop
+against a reduced plant) and in full SITL runs.
 """
 
 from __future__ import annotations
