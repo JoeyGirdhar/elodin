@@ -4,6 +4,8 @@
 //! phase management, and guidance, and replies with actuator/valve commands.
 //! It never sees truth state — only the simulated sensors (WHITEPAPER 12).
 
+#[cfg(test)]
+mod landing_sim;
 mod math;
 mod profile;
 
@@ -35,12 +37,48 @@ const V_PURGE: usize = 7;
 const THROTTLE_MIN: f64 = 0.57;
 const T_VAC_PER_ENGINE: f64 = 829_000.0; // matches plant constants
 const A_E_M2: f64 = 0.681;
+const P_SL_PA: f64 = 101_325.0;
+const DRY_MASS_KG: f64 = 25_600.0;
 /// ZEM/ZEV terminal guidance (Guo/Hawkins/Wie) — LandingBurn.
-const ZEM_WAYPOINT_ALT_M: f64 = 150.0;
-const ZEM_WAYPOINT_VDOWN_MPS: f64 = 25.0;
 const ZEM_V_TD_MPS: f64 = 1.2;
 const ZEM_TILT_CAP_RAD: f64 = 0.25;
-const ZEM_A_LAND_TGO: f64 = 12.0;
+/// Merlin shutdown time constant (plant ENGINE_SHUTDOWN_TAU_S, EST). An
+/// engine commanded off keeps pushing for ~T·τ of impulse while it spools
+/// down, which the 3 -> 1 handover has to count.
+const MERLIN_SHUTDOWN_TAU_S: f64 = 0.35;
+/// Where in the single-engine deceleration band the handover aims (0 = min
+/// throttle, 1 = full). The middle leaves room for thrust dispersion and
+/// tracking error in both directions.
+const SINGLE_ENGINE_BAND_AIM: f64 = 0.5;
+/// Below this height the landing burn stops steering for position and only
+/// nulls horizontal velocity (Apollo P66-style terminal phase).
+const TERMINAL_GATE_M: f64 = 30.0;
+const TERMINAL_VEL_TAU_S: f64 = 1.5;
+/// Gimbal-limited attitude response at landing mass (~1.5 s): the lateral
+/// loops lead by the drift the current lean will add meanwhile.
+const ATTITUDE_LAG_S: f64 = 1.5;
+/// Shortest time-to-go the approach divert is allowed to plan over. ZEM/ZEV
+/// gains grow as 1/t_go², and below a few attitude time constants the
+/// booster cannot follow the command it is given.
+const APPROACH_TGO_FLOOR_S: f64 = 3.0 * ATTITUDE_LAG_S;
+/// Leg pads sit this far off the centerline at the engine plane (plant
+/// LEG_RADIUS_M), so a leaning booster touches down on its low pad first.
+const LEG_PAD_RADIUS_M: f64 = 10.0;
+/// Thrust tilt allowance: full divert authority high up, tapering to a small
+/// trim allowance at the terminal gate and to near-vertical at touchdown.
+const TILT_TAPER_START_M: f64 = 150.0;
+const TERMINAL_TILT_CAP_RAD: f64 = 0.07;
+const TOUCHDOWN_TILT_CAP_RAD: f64 = 0.02;
+/// Merlin throttle response once running (plant ENGINE_THROTTLE_TAU_S, EST).
+const MERLIN_THROTTLE_TAU_S: f64 = 0.15;
+/// In-burn thrust estimate: low-pass time constant and the settling time
+/// after a spool-up or an engine shutdown before the accelerometer is
+/// trusted to reflect commanded thrust (plant spin-up τ = 1.5 s, shutdown
+/// τ = 0.35 s).
+const THRUST_EST_TAU_S: f64 = 1.0;
+const THRUST_EST_SETTLE_IGNITION_S: f64 = 4.0;
+const THRUST_EST_SETTLE_HANDOVER_S: f64 = 1.5;
+const GUIDANCE_DT_S: f64 = 0.01;
 
 /// Shared with the plant through constants.py; heights are WGS84 ellipsoidal.
 #[derive(Clone, Copy, serde::Deserialize)]
@@ -266,6 +304,8 @@ struct Navigator {
     wind_est: V3,
     /// Radar-smoothed antenna height above terrain (m); <0 when invalid.
     radar_agl_m: f64,
+    /// Last radar sample folded in (the bridge holds it between 40 Hz updates).
+    last_radar_range: f64,
     /// CoM above the engine-plane antenna (m), from current propellant.
     station_m: f64,
 }
@@ -283,6 +323,7 @@ impl Navigator {
             initialized: false,
             wind_est: [0.0; 3],
             radar_agl_m: -1.0,
+            last_radar_range: -1.0,
             station_m: 18.8,
         }
     }
@@ -307,6 +348,7 @@ impl Navigator {
         self.initialized = true;
         self.wind_est = [0.0; 3];
         self.radar_agl_m = -1.0;
+        self.last_radar_range = -1.0;
         self.station_m = cg_station_m(s.lox_kg, s.rp1_kg);
     }
 
@@ -343,13 +385,24 @@ impl Navigator {
         if s.radar_range >= 0.0 && s.radar_range < 500.0 {
             let (lat, lon, geo_alt) = ecef_to_geodetic(self.pos);
             let up = scale(ned_basis(lat, lon)[2], -1.0);
-            let body_x = quat_rotate(self.att, [1.0, 0.0, 0.0]);
-            let cos_tilt = dot(body_x, up).max(0.6);
-            let h_agl = s.radar_range * cos_tilt;
-            if self.radar_agl_m < 0.0 {
-                self.radar_agl_m = h_agl;
-            } else {
-                self.radar_agl_m = 0.7 * self.radar_agl_m + 0.3 * h_agl;
+            // Carry the height forward with the navigated vertical rate and
+            // pull it toward each fresh sample. A plain moving average of the
+            // 40 Hz radar trails a descending booster by tens of
+            // milliseconds, which near the pad is decimetres of height the
+            // landing burn never sees.
+            if self.radar_agl_m >= 0.0 {
+                self.radar_agl_m += dot(self.vel, up) * dt;
+            }
+            if s.radar_range != self.last_radar_range {
+                let body_x = quat_rotate(self.att, [1.0, 0.0, 0.0]);
+                let cos_tilt = dot(body_x, up).max(0.6);
+                let h_agl = s.radar_range * cos_tilt;
+                if self.radar_agl_m < 0.0 {
+                    self.radar_agl_m = h_agl;
+                } else {
+                    self.radar_agl_m += 0.3 * (h_agl - self.radar_agl_m);
+                }
+                self.last_radar_range = s.radar_range;
             }
             let dh = (self.radar_agl_m + self.station_m + self.site_alt()) - geo_alt;
             if dh.abs() < 50.0 {
@@ -357,6 +410,7 @@ impl Navigator {
             }
         } else {
             self.radar_agl_m = -1.0;
+            self.last_radar_range = -1.0;
         }
     }
 
@@ -395,6 +449,19 @@ struct Fsw {
     /// 1-3-1 landing-burn engine latch: (escalated to 3, back down to 1).
     landing_escalated: bool,
     landing_deescalated: bool,
+    /// Last landing-burn throttle command, for the handover tail-off estimate.
+    landing_throttle: f64,
+    /// Throttle the engines are actually at: the command through the Merlin
+    /// throttle lag. The thrust estimate compares against this, not the
+    /// command, so throttle motion does not read as a thrust error.
+    landing_spool: f64,
+    /// Measured / modelled thrust during the landing burn. The plant's
+    /// engines are dispersed from the FSW model (main.py `thrust_scale`);
+    /// without this the burn over-brakes, the hoverslam solution drifts below
+    /// min throttle, and the booster stops above the pad.
+    landing_thrust_ratio: f64,
+    /// Earliest time the accelerometer reflects the current engine set.
+    landing_thrust_est_after: f64,
     /// The designed ascent reference: the recorded webcast profile.
     ascent_profile: Option<AscentProfile>,
     t_liftoff: f64,
@@ -425,6 +492,10 @@ impl Fsw {
             track_dir: [1.0, 0.0, 0.0],
             landing_escalated: false,
             landing_deescalated: false,
+            landing_throttle: THROTTLE_MIN,
+            landing_spool: THROTTLE_MIN,
+            landing_thrust_ratio: 1.0,
+            landing_thrust_est_after: f64::INFINITY,
             ascent_profile: std::env::var("ELODIN_F9_PROFILE")
                 .ok()
                 .and_then(|p| AscentProfile::load(&p)),
@@ -724,6 +795,7 @@ impl Fsw {
                         "[fsw] landing ignition: iip miss along={along:.0} cross={cross:.0} m"
                     );
                     self.landing_escalated = true; // 3-engine start (hot RTLS)
+                    self.landing_thrust_est_after = t + THRUST_EST_SETTLE_IGNITION_S;
                     self.set_phase(Phase::LandingBurn, t);
                 }
             }
@@ -733,83 +805,87 @@ impl Fsw {
                 cmd.valves[V_TEATEB] = 1.0;
                 cmd.tvc_enable = 1.0;
                 cmd.rcs_enable = 1.0;
-                // 3→1 engine profile (TEA-TEB): open on three, hand over to
-                // the center engine once a single-engine profile can finish.
-                let mass = 25_600.0 + s.lox_kg + s.rp1_kg;
+                let mass = DRY_MASS_KG + s.lox_kg + s.rp1_kg;
                 let vdown = -dot(self.nav.vel, up_here);
-                let h = h_agl.max(0.5);
-                let t_single_min = THROTTLE_MIN * T_VAC_PER_ENGINE - 101_325.0 * A_E_M2;
-                let a_floor = (t_single_min / mass - 9.81).max(0.5);
-                let a_single = self.landing_accel_net(s, 1.0);
-                let a_mid = 0.5 * (a_floor + a_single);
-                let a_land_1 = 0.70 * a_mid;
-                if self.landing_escalated
-                    && !self.landing_deescalated
-                    && vdown <= (2.0 * a_land_1 * h).sqrt() + 1.0
-                {
-                    self.landing_deescalated = true;
+                let body_x = quat_rotate(self.nav.att, [1.0, 0.0, 0.0]);
+                let cos_tilt = dot(body_x, up_here).max(0.6);
+                // A leaning booster touches down on its low pad first.
+                let h_pad = h_agl - LEG_PAD_RADIUS_M * (1.0 - cos_tilt * cos_tilt).sqrt();
+                let lit = if self.landing_escalated && !self.landing_deescalated {
+                    3.0
+                } else {
+                    1.0
+                };
+                // Thrust estimate: once the current engine set has settled,
+                // compare the measured axial specific force with what the
+                // engine model predicts for where the throttle actually is.
+                self.landing_spool += (self.landing_throttle - self.landing_spool)
+                    * (1.0 - (-GUIDANCE_DT_S / MERLIN_THROTTLE_TAU_S).exp());
+                let predicted = lit * engine_thrust(self.landing_spool) / mass;
+                if t >= self.landing_thrust_est_after && predicted > 1.0 {
+                    let ratio = (s.imu_accel[0] / predicted).clamp(0.8, 1.25);
+                    self.landing_thrust_ratio +=
+                        (ratio - self.landing_thrust_ratio) * GUIDANCE_DT_S / THRUST_EST_TAU_S;
+                }
+                let k_thrust = self.landing_thrust_ratio;
+
+                // 3 -> 1 handover (TEA-TEB): open on three and hand over to the
+                // center engine once the state the outboard pair leaves behind,
+                // tail-off impulse included, sits in the middle of the
+                // single-engine band. Handing over on the band's edge strands
+                // the booster below what one engine can fly at min throttle.
+                if lit > 1.0 {
+                    let tail_dv = 2.0
+                        * k_thrust
+                        * engine_thrust(self.landing_throttle)
+                        * MERLIN_SHUTDOWN_TAU_S
+                        / mass;
+                    let h_after = h_pad - vdown * MERLIN_SHUTDOWN_TAU_S;
+                    let (lo, hi) = decel_band(mass, 1.0, k_thrust);
+                    let aim = lo + SINGLE_ENGINE_BAND_AIM * (hi - lo);
+                    if required_decel(h_after, vdown - tail_dv) <= aim {
+                        self.landing_deescalated = true;
+                        self.landing_thrust_est_after = t + THRUST_EST_SETTLE_HANDOVER_S;
+                    }
                 }
                 let three = self.landing_escalated && !self.landing_deescalated;
-                let (n, a_land) = if three {
-                    (3.0, 0.70 * self.landing_accel_net(s, 3.0))
-                } else {
-                    (1.0, a_land_1)
-                };
-                // Continuous hoverslam vertical (WHITEAPER 11.5): T_min/W > 1
-                // so we never coast mid-burn — the rate loop keeps vdown on the
-                // suicide curve. ZEM/ZEV only shapes the thrust *direction*.
-                let v_des = (2.0 * a_land * h_agl.max(0.0) + ZEM_V_TD_MPS * ZEM_V_TD_MPS).sqrt();
-                let kv = if h_agl < 15.0 {
-                    6.5
-                } else if h_agl < 50.0 {
-                    5.0
-                } else if h_agl < 200.0 {
-                    4.0
-                } else {
-                    3.2
-                };
-                // Feedforward a_land: on-speed must still decelerate, not hover.
-                let mut a_up = (9.81 + a_land + kv * (vdown - v_des)).max(0.0);
-                if h_agl < 8.0 && vdown > 2.5 {
-                    a_up += 2.0; // last-metres flare for spool lag
-                }
+                let n = if three { 3.0 } else { 1.0 };
 
-                let (t_go, _) = Self::t_go_hoverslam(h, vdown.max(1.0));
-                // Being close to the pad does not mean lateral velocity is zero.
-                // Keep braking it until touchdown rather than committing to
-                // a vertical thrust direction during the final metres.
-                let a_zem = self.zem_zev_accel(up_here, t_go);
-                let a_up_zem = dot(a_zem, up_here);
-                let a_lat = sub(a_zem, scale(up_here, a_up_zem));
-                let lat_mag = norm(a_lat);
-                // Progressively stand up over the last 50 m while retaining
-                // a small lateral correction authority.
-                let tilt_cap = 3.0_f64.to_radians()
-                    + (ZEM_TILT_CAP_RAD - 3.0_f64.to_radians()) * (h_agl / 50.0).clamp(0.0, 1.0);
-                let max_lat = (a_up.max(9.81)) * tilt_cap.tan();
-                let a_lat = if lat_mag > max_lat && lat_mag > 1e-6 {
-                    scale(normalize(a_lat), max_lat)
-                } else {
-                    a_lat
-                };
-                let a_cmd = add(scale(up_here, a_up.max(9.81)), a_lat);
-                let dir = normalize(a_cmd);
+                // Vertical channel (WHITEPAPER 11.5): fly the constant
+                // deceleration that reaches the touchdown speed exactly at the
+                // pad, recomputed from the navigated state every step, so a
+                // drag or mass error changes the next solution instead of
+                // accumulating against a fixed profile. T_min/W > 1, so the
+                // request is clamped to what the lit engines can deliver.
+                let (lo, hi) = decel_band(mass, n, k_thrust);
+                let a_net = required_decel(h_pad, vdown).clamp(lo, hi);
+                let a_up = 9.81 + a_net;
+
+                // Lateral channel: ZEM/ZEV onto LZ-1, then velocity nulling
+                // inside the terminal gate. Lateral braking stays on until
+                // contact; only the position term is dropped.
+                let a_lat = self.landing_lateral_accel(up_here, h_pad, vdown, a_net, a_up);
+                let dir = normalize(add(scale(up_here, a_up), a_lat));
                 let desired = quat_between([1.0, 0.0, 0.0], dir);
                 cmd.attitude = self.slew_attitude(desired, 0.01);
-                let body_x = quat_rotate(cmd.attitude, [1.0, 0.0, 0.0]);
-                cmd.fins = self.fin_attitude_pd(body_x, s, true);
+                let cmd_x = quat_rotate(cmd.attitude, [1.0, 0.0, 0.0]);
+                cmd.fins = self.fin_attitude_pd(cmd_x, s, true);
 
-                let cos_tilt = dot(body_x, up_here).max(0.6);
-                let mut u = ((mass * a_up / cos_tilt / n + 101_325.0 * A_E_M2) / T_VAC_PER_ENGINE)
-                    .clamp(THROTTLE_MIN, 1.0);
-                if h_agl < 2.5 && vdown > 2.2 {
-                    u = u.max(0.76); // don't ease off in the last 2.5 m
-                }
+                // Size thrust for the attitude the booster actually has; the
+                // engines push along that axis, not along the setpoint.
+                let per_engine = mass * a_up / cos_tilt / n / k_thrust;
+                let u =
+                    ((per_engine + P_SL_PA * A_E_M2) / T_VAC_PER_ENGINE).clamp(THROTTLE_MIN, 1.0);
+                self.landing_throttle = u;
+                // The center engine has used its last TEA-TEB charge, so it
+                // stays lit until contact. The one exception: if the booster
+                // has stopped short and started to rise, min throttle will
+                // only carry it higher (T_min/W > 1), so shut down while the
+                // drop is still centimetres rather than climb until the
+                // propellant runs out.
+                let rising_short = h_agl < 3.0 && vdown < -0.2;
                 let mut engines = [0.0; N_ENGINES];
-                // If min-throttle has lofted us (T_min/W > 1), cut until we
-                // are descending again — otherwise we climb away from the pad.
-                let lofting = h_agl > 1.0 && h_agl < 100.0 && vdown < -0.5;
-                if !lofting {
+                if !rising_short {
                     engines[0] = u;
                     if three {
                         engines[1] = u;
@@ -985,44 +1061,101 @@ impl Fsw {
         // Near-full throttle at the estimated landing mass (propellant
         // knowledge comes from the FSW's own flow accounting; the bridge
         // forwards it as config).
-        let mass = 25_600.0 + s.lox_kg + s.rp1_kg;
-        let thrust = n_engines * 0.85 * (T_VAC_PER_ENGINE - 101_325.0 * A_E_M2);
+        let mass = DRY_MASS_KG + s.lox_kg + s.rp1_kg;
+        let thrust = n_engines * 0.85 * (T_VAC_PER_ENGINE - P_SL_PA * A_E_M2);
         (thrust / mass - 9.81).max(1.0)
     }
 
-    /// Hoverslam-consistent time-to-go: `(t_go_clamped, t_raw)`.
-    fn t_go_hoverslam(h: f64, vdown: f64) -> (f64, f64) {
-        let h = h.max(0.5);
-        let vdown = vdown.max(0.1);
-        let a_req = (vdown * vdown - ZEM_V_TD_MPS * ZEM_V_TD_MPS).max(0.0) / (2.0 * h);
-        let a_use = a_req.clamp(0.5, ZEM_A_LAND_TGO);
-        let t_raw = (vdown - ZEM_V_TD_MPS) / a_use;
-        (t_raw.clamp(0.5, 80.0), t_raw)
-    }
-
-    /// ZEM/ZEV thrust-acceleration command (ECEF). Target is LZ-1 with a
-    /// 150 m / −25 m/s waypoint until crossed, then pad / −1.5 m/s.
-    fn zem_zev_accel(&self, up: V3, t_go: f64) -> V3 {
-        // Wind-bias the aim point upwind by the expected terminal drift.
-        let wind_h = sub(self.nav.wind_est, scale(up, dot(self.nav.wind_est, up)));
-        let aim = sub(self.lz1_pos, scale(wind_h, t_go.min(25.0)));
-        let r = sub(self.nav.pos, aim);
-        let v = self.nav.vel;
-        let alt = self.nav.height_agl();
-        let g_vec = scale(up, -9.81);
-        let (r_tgt, v_tgt) = if alt > ZEM_WAYPOINT_ALT_M {
-            (
-                scale(up, ZEM_WAYPOINT_ALT_M),
-                scale(up, -ZEM_WAYPOINT_VDOWN_MPS),
-            )
+    /// Horizontal thrust acceleration for the landing burn (WHITEPAPER 11.5).
+    ///
+    /// Approach, above the terminal gate: ZEM/ZEV in the horizontal plane,
+    /// targeting the point over LZ-1 with no sideways velocity at the moment
+    /// the booster reaches the gate. Time-to-go is the time to the gate on the
+    /// current deceleration solution, floored so the divert never outruns the
+    /// gimbal-limited attitude loop.
+    ///
+    /// Terminal, below the gate: null horizontal velocity only (Apollo
+    /// P66-style). A metre of miss this close to the pad is not worth a lean.
+    ///
+    /// Both lead the velocity by the drift the current lean adds before the
+    /// attitude can respond.
+    fn landing_lateral_accel(&self, up: V3, h_pad: f64, vdown: f64, a_net: f64, a_up: f64) -> V3 {
+        let horizontal = |a: V3| sub(a, scale(up, dot(a, up)));
+        // Plan from where the booster will be once a new attitude can take
+        // effect: the current lean keeps accelerating it sideways for about
+        // one attitude lag.
+        let x_body = quat_rotate(self.nav.att, [1.0, 0.0, 0.0]);
+        let lean = scale(horizontal(x_body), a_up / dot(x_body, up).max(0.6));
+        let lag = ATTITUDE_LAG_S;
+        let v = add(horizontal(self.nav.vel), scale(lean, lag));
+        let a_lat = if h_pad > TERMINAL_GATE_M {
+            // Wind-bias the aim point upwind by the expected terminal drift.
+            let t_land = (vdown - ZEM_V_TD_MPS).max(0.0) / a_net;
+            let wind = horizontal(self.nav.wind_est);
+            let aim = sub(self.lz1_pos, scale(wind, t_land.min(25.0)));
+            let r_now = horizontal(sub(self.nav.pos, aim));
+            let r = add(
+                add(r_now, scale(horizontal(self.nav.vel), lag)),
+                scale(lean, 0.5 * lag * lag),
+            );
+            let t_gate = time_to_descend(h_pad - TERMINAL_GATE_M, vdown, a_net) - lag;
+            let t = t_gate.max(APPROACH_TGO_FLOOR_S);
+            // ZEM = −(r + v t), ZEV = −v  ⇒  a = 6 ZEM/t² − 2 ZEV/t.
+            add(scale(r, -6.0 / (t * t)), scale(v, -4.0 / t))
         } else {
-            ([0.0; 3], scale(up, -ZEM_V_TD_MPS))
+            scale(v, -1.0 / TERMINAL_VEL_TAU_S)
         };
-        let t2 = t_go * t_go;
-        let zem = sub(r_tgt, add(add(r, scale(v, t_go)), scale(g_vec, 0.5 * t2)));
-        let zev = sub(v_tgt, add(v, scale(g_vec, t_go)));
-        // a_cmd = 6 ZEM/t² − 2 ZEV/t − g  (thrust accel; plant adds gravity)
-        sub(add(scale(zem, 6.0 / t2), scale(zev, -2.0 / t_go)), g_vec)
+        let max_lat = a_up * landing_tilt_cap(h_pad).tan();
+        let mag = norm(a_lat);
+        if mag > max_lat && mag > 1e-6 {
+            scale(a_lat, max_lat / mag)
+        } else {
+            a_lat
+        }
+    }
+}
+
+/// Sea-level thrust of one Merlin at throttle `u` (FSW engine model).
+fn engine_thrust(u: f64) -> f64 {
+    (u * T_VAC_PER_ENGINE - P_SL_PA * A_E_M2).max(0.0)
+}
+
+/// Net upward acceleration (thrust/m − g) that `n_engines` can produce at
+/// `mass`, as (min throttle, full throttle), with the model thrust scaled by
+/// the in-flight estimate `k_thrust`.
+fn decel_band(mass: f64, n_engines: f64, k_thrust: f64) -> (f64, f64) {
+    let net = |u: f64| n_engines * k_thrust * engine_thrust(u) / mass - 9.81;
+    (net(THROTTLE_MIN), net(1.0))
+}
+
+/// Constant deceleration that brings the descent rate to the touchdown
+/// speed exactly at the pad: the hoverslam solution from the current state.
+fn required_decel(h_agl: f64, vdown: f64) -> f64 {
+    (vdown * vdown - ZEM_V_TD_MPS * ZEM_V_TD_MPS).max(0.0) / (2.0 * h_agl.max(0.3))
+}
+
+/// Time to descend `dh` metres starting at `vdown` under constant
+/// deceleration `a`; if the booster would stop first, the time to stop.
+fn time_to_descend(dh: f64, vdown: f64, a: f64) -> f64 {
+    let disc = vdown * vdown - 2.0 * a * dh.max(0.0);
+    if disc > 0.0 {
+        (vdown - disc.sqrt()) / a
+    } else {
+        vdown.max(0.0) / a
+    }
+}
+
+/// Thrust tilt allowed during the landing burn: the full divert allowance
+/// above `TILT_TAPER_START_M`, a small trim allowance at the terminal gate,
+/// and near-vertical at the pad. The TVC loop needs seconds to stand a
+/// leaning booster back up, so the taper starts well above the gate.
+fn landing_tilt_cap(h_pad: f64) -> f64 {
+    if h_pad > TERMINAL_GATE_M {
+        let f = ((h_pad - TERMINAL_GATE_M) / (TILT_TAPER_START_M - TERMINAL_GATE_M)).min(1.0);
+        TERMINAL_TILT_CAP_RAD + f * (ZEM_TILT_CAP_RAD - TERMINAL_TILT_CAP_RAD)
+    } else {
+        let f = (h_pad / TERMINAL_GATE_M).max(0.0);
+        TOUCHDOWN_TILT_CAP_RAD + f * (TERMINAL_TILT_CAP_RAD - TOUCHDOWN_TILT_CAP_RAD)
     }
 }
 
