@@ -913,7 +913,7 @@ the downstream q̄ peak (~60 kPa reconstructed) and heating. A predictor-based
 cutoff — integrate the no-thrust descent forward, cut when predicted peak q̄
 drops below the limit — is the stretch goal; the Δv gate is the baseline.
 
-### 11.5 Landing burn: hoverslam + ZEM/ZEV
+### 11.5 Landing burn: hoverslam + braking-curve divert
 
 The booster cannot hover: at landing mass `m ≈ 27 t` (*est.*), even minimum
 single-engine throttle gives
@@ -959,21 +959,23 @@ center engine has used its last TEA-TEB charge by then, so it stays lit
 until contact; a booster that has stopped short and started to rise shuts
 down while the drop is still centimetres rather than climbing away.
 
-**Lateral channel.** Above a 30 m terminal gate, horizontal ZEM/ZEV
-(Guo/Hawkins/Wie) targets the point over LZ-1 with no sideways velocity at
-the gate:
+**Lateral channel.** Above a 30 m terminal gate the booster flies the
+fastest approach to LZ-1 it can still stop from, the lateral counterpart of
+the vertical hoverslam:
 
 ```text
-ZEM = −(r + v t_go),   ZEV = −v,   a_lat = 6 ZEM/t_go² − 2 ZEV/t_go
+v_cmd = −a_b T + √((a_b T)² + 2 a_b d),     a_lat = (v_cmd r̂ − v) / τ
 ```
 
-`t_go` is the time to the gate on the current vertical solution, floored at
-three attitude lags (4.5 s): a single gimbaled Merlin needs ~1.5 s to change
-the lean, and the ZEM gain grows as 1/t_go². `r` and `v` are propagated one
-attitude lag ahead with the acceleration the current lean is producing.
-Below the gate only horizontal velocity is nulled (Apollo P66-style); a
-metre of miss this close to the pad is not worth a lean, and lateral braking
-stays on until contact. The thrust tilt allowance tapers from 0.25 rad above
+`d` is the distance to the aim point, `T` is two attitude lags (the lean has
+to swing through vertical before it brakes) and `a_b` is a share of the
+tilt-limited lateral acceleration, averaged over the heights the stop will
+take, because the tilt allowance shrinks on the way down. `r` and `v` are
+propagated one attitude lag (~1.5 s) ahead with the acceleration the current
+lean is producing. A divert too large for the burn therefore ends short of
+the pad and slow, never fast and past it. Below the gate only horizontal
+velocity is nulled (Apollo P66-style); a metre of miss this close to the pad
+is not worth a lean. The thrust tilt allowance tapers from 0.25 rad above
 150 m to 0.07 rad at the gate and 0.02 rad at the pad. Legs are rated
 **2 m/s** impact (vertical and total contact speed); soft-landing gates also
 require tilt ≤ 2°, |ω| ≤ 1°/s, lateral ≤ 1.5 m/s, miss ≤ 5 m.

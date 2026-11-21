@@ -53,20 +53,21 @@ const SINGLE_ENGINE_BAND_AIM: f64 = 0.5;
 /// Below this height the landing burn stops steering for position and only
 /// nulls horizontal velocity (Apollo P66-style terminal phase).
 const TERMINAL_GATE_M: f64 = 30.0;
-const TERMINAL_VEL_TAU_S: f64 = 1.5;
+/// Lateral velocity loop time constant, slow enough for the gimbal-limited
+/// attitude response.
+const LATERAL_VEL_TAU_S: f64 = 1.5;
 /// Gimbal-limited attitude response at landing mass (~1.5 s): the lateral
 /// loops lead by the drift the current lean will add meanwhile.
 const ATTITUDE_LAG_S: f64 = 1.5;
-/// Shortest time-to-go the approach divert is allowed to plan over. ZEM/ZEV
-/// gains grow as 1/t_go², and below a few attitude time constants the
-/// booster cannot follow the command it is given.
-const APPROACH_TGO_FLOOR_S: f64 = 3.0 * ATTITUDE_LAG_S;
 /// Leg pads sit this far off the centerline at the engine plane (plant
 /// LEG_RADIUS_M), so a leaning booster touches down on its low pad first.
 const LEG_PAD_RADIUS_M: f64 = 10.0;
 /// Thrust tilt allowance: full divert authority high up, tapering to a small
 /// trim allowance at the terminal gate and to near-vertical at touchdown.
 const TILT_TAPER_START_M: f64 = 150.0;
+/// Share of the tilt-limited lateral acceleration the approach may plan to
+/// brake with. The rest is headroom for the attitude lag and for wind.
+const DIVERT_BRAKE_MARGIN: f64 = 0.6;
 const TERMINAL_TILT_CAP_RAD: f64 = 0.07;
 const TOUCHDOWN_TILT_CAP_RAD: f64 = 0.02;
 /// Merlin throttle response once running (plant ENGINE_THROTTLE_TAU_S, EST).
@@ -791,8 +792,18 @@ impl Fsw {
                 }
                 if alt <= p.landing_arm_alt_m && vdown * p.landing_accel_margin >= v_profile {
                     let (along, cross) = self.iip_miss_components(s, up_here);
+                    // Local state too, so a landing-burn change can be
+                    // reproduced from the same starting point offline.
+                    let (lat, lon, _) = ecef_to_geodetic(self.lz1_pos);
+                    let [north, east, _] = ned_basis(lat, lon);
+                    let d = sub(self.nav.pos, self.lz1_pos);
                     eprintln!(
-                        "[fsw] landing ignition: iip miss along={along:.0} cross={cross:.0} m"
+                        "[fsw] landing ignition: iip miss along={along:.0} cross={cross:.0} m; \
+                         h={h_agl:.0} m vdown={vdown:.1} m/s offset E={:.0} N={:.0} m vel E={:.1} N={:.1} m/s",
+                        dot(d, east),
+                        dot(d, north),
+                        dot(self.nav.vel, east),
+                        dot(self.nav.vel, north),
                     );
                     self.landing_escalated = true; // 3-engine start (hot RTLS)
                     self.landing_thrust_est_after = t + THRUST_EST_SETTLE_IGNITION_S;
@@ -861,9 +872,8 @@ impl Fsw {
                 let a_net = required_decel(h_pad, vdown).clamp(lo, hi);
                 let a_up = 9.81 + a_net;
 
-                // Lateral channel: ZEM/ZEV onto LZ-1, then velocity nulling
-                // inside the terminal gate. Lateral braking stays on until
-                // contact; only the position term is dropped.
+                // Lateral channel: a stoppable approach onto LZ-1, then
+                // velocity nulling inside the terminal gate.
                 let a_lat = self.landing_lateral_accel(up_here, h_pad, vdown, a_net, a_up);
                 let dir = normalize(add(scale(up_here, a_up), a_lat));
                 let desired = quat_between([1.0, 0.0, 0.0], dir);
@@ -1068,16 +1078,18 @@ impl Fsw {
 
     /// Horizontal thrust acceleration for the landing burn (WHITEPAPER 11.5).
     ///
-    /// Approach, above the terminal gate: ZEM/ZEV in the horizontal plane,
-    /// targeting the point over LZ-1 with no sideways velocity at the moment
-    /// the booster reaches the gate. Time-to-go is the time to the gate on the
-    /// current deceleration solution, floored so the divert never outruns the
-    /// gimbal-limited attitude loop.
+    /// Above the terminal gate the lateral channel mirrors the vertical one:
+    /// it steers toward the aim point at the fastest speed it could still
+    /// brake to zero in the distance left, using a fixed share of the tilt
+    /// allowance averaged over the heights the stop will take, and leaving
+    /// time for the lean to reverse. A divert too large for the burn therefore ends short of the
+    /// pad and slow, never fast and past it. Near the aim point the profile
+    /// turns into a plain proportional approach.
     ///
     /// Terminal, below the gate: null horizontal velocity only (Apollo
     /// P66-style). A metre of miss this close to the pad is not worth a lean.
     ///
-    /// Both lead the velocity by the drift the current lean adds before the
+    /// Both lead the state by the drift the current lean adds before the
     /// attitude can respond.
     fn landing_lateral_accel(&self, up: V3, h_pad: f64, vdown: f64, a_net: f64, a_up: f64) -> V3 {
         let horizontal = |a: V3| sub(a, scale(up, dot(a, up)));
@@ -1098,12 +1110,30 @@ impl Fsw {
                 add(r_now, scale(horizontal(self.nav.vel), lag)),
                 scale(lean, 0.5 * lag * lag),
             );
-            let t_gate = time_to_descend(h_pad - TERMINAL_GATE_M, vdown, a_net) - lag;
-            let t = t_gate.max(APPROACH_TGO_FLOOR_S);
-            // ZEM = −(r + v t), ZEV = −v  ⇒  a = 6 ZEM/t² − 2 ZEV/t.
-            add(scale(r, -6.0 / (t * t)), scale(v, -4.0 / t))
+            let dist = norm(r);
+            // Stopping-distance speed with a reaction time: the lean has to
+            // swing through vertical before it brakes.
+            let t_react = 2.0 * lag;
+            // The tilt allowance shrinks as the booster descends, so brake
+            // with what is left on average between here and where the stop
+            // would finish, not with what is available right now.
+            let speed_now = norm(v);
+            let mut a_brake = DIVERT_BRAKE_MARGIN * a_up * landing_tilt_cap(h_pad).tan();
+            for _ in 0..2 {
+                let t_stop = t_react + speed_now / a_brake;
+                let h_end = (h_pad - 0.5 * vdown * t_stop).max(0.0);
+                a_brake = DIVERT_BRAKE_MARGIN * a_up * mean_tilt_cap(h_end, h_pad).tan();
+            }
+            let speed =
+                -a_brake * t_react + ((a_brake * t_react).powi(2) + 2.0 * a_brake * dist).sqrt();
+            let v_cmd = if dist > 1e-6 {
+                scale(r, -speed / dist)
+            } else {
+                [0.0; 3]
+            };
+            scale(sub(v_cmd, v), 1.0 / LATERAL_VEL_TAU_S)
         } else {
-            scale(v, -1.0 / TERMINAL_VEL_TAU_S)
+            scale(v, -1.0 / LATERAL_VEL_TAU_S)
         };
         let max_lat = a_up * landing_tilt_cap(h_pad).tan();
         let mag = norm(a_lat);
@@ -1134,15 +1164,13 @@ fn required_decel(h_agl: f64, vdown: f64) -> f64 {
     (vdown * vdown - ZEM_V_TD_MPS * ZEM_V_TD_MPS).max(0.0) / (2.0 * h_agl.max(0.3))
 }
 
-/// Time to descend `dh` metres starting at `vdown` under constant
-/// deceleration `a`; if the booster would stop first, the time to stop.
-fn time_to_descend(dh: f64, vdown: f64, a: f64) -> f64 {
-    let disc = vdown * vdown - 2.0 * a * dh.max(0.0);
-    if disc > 0.0 {
-        (vdown - disc.sqrt()) / a
-    } else {
-        vdown.max(0.0) / a
-    }
+/// Average of `landing_tilt_cap` over the heights from `lo` to `hi`.
+fn mean_tilt_cap(lo: f64, hi: f64) -> f64 {
+    const N: usize = 8;
+    (0..N)
+        .map(|i| landing_tilt_cap(lo + (hi - lo) * (i as f64 + 0.5) / N as f64))
+        .sum::<f64>()
+        / N as f64
 }
 
 /// Thrust tilt allowed during the landing burn: the full divert allowance
